@@ -15,14 +15,19 @@ FastAPI 서버 — Stable Diffusion 1.5 이미지 생성
 
 import asyncio
 import base64
+import hashlib
+import json
 import os
+import secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Literal
 from io import BytesIO
 
 import torch
 from diffusers import StableDiffusionPipeline
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -33,6 +38,36 @@ executor = ThreadPoolExecutor(max_workers=1)  # 순차 생성 (VRAM 충돌 방�
 
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
 HF_TOKEN = os.getenv("HF_TOKEN") or None
+
+# ── 인증 — 사용자 저장소 ──────────────────────────────────────────────────────
+
+USERS_FILE = Path(__file__).parent / "users.json"
+active_tokens: dict[str, str] = {}  # token -> user_id
+
+
+def _load_users() -> dict[str, dict]:
+    if not USERS_FILE.exists():
+        return {}
+    return json.loads(USERS_FILE.read_text(encoding="utf-8"))
+
+
+def _save_users(users: dict[str, dict]) -> None:
+    USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _hash_pw(password: str, salt: str) -> str:
+    return hashlib.sha256(f"{salt}{password}".encode()).hexdigest()
+
+
+def require_auth(authorization: str = Header(...)) -> str:
+    """Authorization: Bearer <token> 헤더에서 user_id 추출"""
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="인증 토큰이 필요합니다.")
+    token = authorization[7:]
+    user_id = active_tokens.get(token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="유효하지 않거나 만료된 토큰입니다.")
+    return user_id
 
 
 # ── 앱 생명주기 (시작 시 모델 로드) ──────────────────────────────────────────
@@ -72,15 +107,74 @@ app = FastAPI(title="Stable Diffusion 1.5 API", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ── 인증 스키마 ───────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    username: str = Field(min_length=2, max_length=20)
+    email: str = Field(min_length=5)
+    password: str = Field(min_length=6)
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+class AuthResponse(BaseModel):
+    token: str
+    user_id: str
+    username: str
+    email: str
+
+
+# ── 인증 엔드포인트 ────────────────────────────────────────────────────────────
+
+@app.post("/auth/register", response_model=AuthResponse)
+async def register(req: RegisterRequest):
+    users = _load_users()
+    if any(u["email"] == req.email for u in users.values()):
+        raise HTTPException(status_code=409, detail="이미 사용 중인 이메일입니다.")
+    user_id = secrets.token_hex(8)
+    salt = secrets.token_hex(16)
+    users[user_id] = {
+        "id": user_id,
+        "username": req.username,
+        "email": req.email,
+        "salt": salt,
+        "password_hash": _hash_pw(req.password, salt),
+    }
+    _save_users(users)
+    token = secrets.token_hex(32)
+    active_tokens[token] = user_id
+    return AuthResponse(token=token, user_id=user_id, username=req.username, email=req.email)
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+async def login(req: LoginRequest):
+    users = _load_users()
+    user = next((u for u in users.values() if u["email"] == req.email), None)
+    if not user or _hash_pw(req.password, user["salt"]) != user["password_hash"]:
+        raise HTTPException(status_code=401, detail="이메일 또는 비밀번호가 올바르지 않습니다.")
+    token = secrets.token_hex(32)
+    active_tokens[token] = user["id"]
+    return AuthResponse(token=token, user_id=user["id"], username=user["username"], email=user["email"])
+
+
+@app.post("/auth/logout")
+async def logout(authorization: str = Header(...)):
+    if authorization.startswith("Bearer "):
+        active_tokens.pop(authorization[7:], None)
+    return {"ok": True}
+
+
 # ── 요청 / 응답 스키마 ────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
+    model: Literal["sd15", "sd15-lcm"] = "sd15"  # sd15-lcm은 향후 구현 예정
     prompt: str
     negative_prompt: str = Field(default="blurry, low quality, ugly, deformed, watermark")
     count: int = Field(default=1, ge=1, le=8)
@@ -137,13 +231,16 @@ async def health():
 
 
 @app.post("/generate", response_model=GenerateResponse)
-async def generate(req: GenerateRequest):
+async def generate(req: GenerateRequest, _: str = Depends(require_auth)):
     """프롬프트로 이미지를 count장 생성합니다."""
     if pipe is None:
         raise HTTPException(
             status_code=503,
             detail="모델 로딩 중입니다. /health 에서 model_loaded 가 true가 될 때까지 대기하세요.",
         )
+
+    if req.model == "sd15-lcm":
+        print("[SD] sd15-lcm 요청 수신 — 현재 SD 1.5로 폴백 (LCM 미구현)")
 
     loop = asyncio.get_event_loop()
     images: list[str | None] = []
