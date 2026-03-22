@@ -7,3 +7,4 @@ sentencepiece>=0.2.0
 Pillow>=10.0.0
 torch>=2.3.0
 deep-translator>=1.11.0
+einops>=0.8.0

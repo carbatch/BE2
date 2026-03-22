@@ -25,12 +25,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 from io import BytesIO
+from PIL import Image
 
 from deep_translator import GoogleTranslator
 
 import torch
 from diffusers import StableDiffusionPipeline
-from transformers import BlipProcessor, BlipForConditionalGeneration
+from transformers import AutoProcessor, AutoModelForCausalLM
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -63,31 +64,52 @@ def _translate_if_korean(text: str) -> str:
         return text
 
 
-# ── BLIP 이미지 캡셔닝 (lazy load) ──────────────────────────────────────────
+# ── Florence-2 (HuggingFace 로컬) — 이미지 스타일 추출 ──────────────────────
 
-_blip_processor: BlipProcessor | None = None
-_blip_model: BlipForConditionalGeneration | None = None
+VL_MODEL_ID = "microsoft/Florence-2-base"
 
-
-def _load_blip() -> tuple[BlipProcessor, BlipForConditionalGeneration]:
-    global _blip_processor, _blip_model
-    if _blip_processor is None:
-        print("[BLIP] 모델 로딩 중...")
-        _blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-        _blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
-        _blip_model.eval()
-        print("[BLIP] 모델 로드 완료")
-    return _blip_processor, _blip_model
+_vl_processor: AutoProcessor | None = None
+_vl_model:     AutoModelForCausalLM | None = None
 
 
-def _caption_image(image_b64: str) -> str:
-    proc, model = _load_blip()
+def _load_vl() -> tuple[AutoProcessor, AutoModelForCausalLM]:
+    global _vl_processor, _vl_model
+    if _vl_processor is None:
+        print(f"[VL] 모델 로딩 중: {VL_MODEL_ID}")
+        _vl_processor = AutoProcessor.from_pretrained(VL_MODEL_ID, trust_remote_code=True)
+        _vl_model = AutoModelForCausalLM.from_pretrained(
+            VL_MODEL_ID,
+            trust_remote_code=True,
+            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+        ).eval()
+        print("[VL] 모델 로드 완료")
+    return _vl_processor, _vl_model
+
+
+def _extract_style_local(image_b64: str) -> str:
+    processor, model = _load_vl()
+
     raw = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
     img = Image.open(BytesIO(base64.b64decode(raw))).convert("RGB")
-    inputs = proc(img, return_tensors="pt")
+
+    task = "<MORE_DETAILED_CAPTION>"
+    inputs = processor(text=task, images=img, return_tensors="pt").to(model.device)
+
     with torch.no_grad():
-        out = model.generate(**inputs, max_new_tokens=120)
-    return proc.decode(out[0], skip_special_tokens=True)
+        generated_ids = model.generate(
+            input_ids=inputs["input_ids"],
+            pixel_values=inputs["pixel_values"],
+            max_new_tokens=200,
+            do_sample=False,
+        )
+
+    generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
+    result = processor.post_process_generation(
+        generated_text,
+        task=task,
+        image_size=(img.width, img.height),
+    )
+    return result[task]
 
 
 USERS_FILE  = Path(__file__).parent / "users.json"
@@ -289,11 +311,11 @@ class AnalyzeImageRequest(BaseModel):
 
 @app.post("/analyze-image")
 async def analyze_image(req: AnalyzeImageRequest, _: str = Depends(require_auth)):
-    """이미지에서 스타일 프롬프트 추출 (BLIP 캡셔닝)"""
+    """이미지에서 스타일 프롬프트 추출 (DeepSeek-VL 로컬)"""
     try:
         loop = asyncio.get_event_loop()
-        caption = await loop.run_in_executor(None, _caption_image, req.image)
-        return {"style_prompt": caption}
+        style = await loop.run_in_executor(None, _extract_style_local, req.image)
+        return {"style_prompt": style}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"이미지 분석 실패: {e}")
 
