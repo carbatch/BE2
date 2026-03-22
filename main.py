@@ -18,6 +18,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -25,8 +26,11 @@ from pathlib import Path
 from typing import Literal
 from io import BytesIO
 
+from deep_translator import GoogleTranslator
+
 import torch
 from diffusers import StableDiffusionPipeline
+from transformers import BlipProcessor, BlipForConditionalGeneration
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -41,7 +45,53 @@ HF_TOKEN = os.getenv("HF_TOKEN") or None
 
 # ── 인증 — 사용자 저장소 ──────────────────────────────────────────────────────
 
-USERS_FILE = Path(__file__).parent / "users.json"
+
+# ── 한->영 번역 ────────────────────────────────────────────────────────────────
+
+_KO_PATTERN = re.compile(r'[가-힣ᄀ-ᇿ㄰-㆏]')
+
+def _translate_if_korean(text: str) -> str:
+    if not _KO_PATTERN.search(text):
+        return text
+    try:
+        result = GoogleTranslator(source='ko', target='en').translate(text)
+        translated = result or text
+        print(f"[번역] {text!r} -> {translated!r}")
+        return translated
+    except Exception as e:
+        print(f"[번역] 실패, 원본 사용: {e}")
+        return text
+
+
+# ── BLIP 이미지 캡셔닝 (lazy load) ──────────────────────────────────────────
+
+_blip_processor: BlipProcessor | None = None
+_blip_model: BlipForConditionalGeneration | None = None
+
+
+def _load_blip() -> tuple[BlipProcessor, BlipForConditionalGeneration]:
+    global _blip_processor, _blip_model
+    if _blip_processor is None:
+        print("[BLIP] 모델 로딩 중...")
+        _blip_processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
+        _blip_model = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+        _blip_model.eval()
+        print("[BLIP] 모델 로드 완료")
+    return _blip_processor, _blip_model
+
+
+def _caption_image(image_b64: str) -> str:
+    proc, model = _load_blip()
+    raw = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
+    img = Image.open(BytesIO(base64.b64decode(raw))).convert("RGB")
+    inputs = proc(img, return_tensors="pt")
+    with torch.no_grad():
+        out = model.generate(**inputs, max_new_tokens=120)
+    return proc.decode(out[0], skip_special_tokens=True)
+
+
+USERS_FILE  = Path(__file__).parent / "users.json"
+TOKENS_FILE = Path(__file__).parent / "tokens.json"
 active_tokens: dict[str, str] = {}  # token -> user_id
 
 
@@ -53,6 +103,16 @@ def _load_users() -> dict[str, dict]:
 
 def _save_users(users: dict[str, dict]) -> None:
     USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_tokens() -> dict[str, str]:
+    if not TOKENS_FILE.exists():
+        return {}
+    return json.loads(TOKENS_FILE.read_text(encoding="utf-8"))
+
+
+def _save_tokens() -> None:
+    TOKENS_FILE.write_text(json.dumps(active_tokens, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _hash_pw(password: str, salt: str) -> str:
@@ -74,7 +134,9 @@ def require_auth(authorization: str = Header(...)) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pipe
+    global pipe, active_tokens
+    active_tokens = _load_tokens()
+    print(f"[인증] 저장된 토큰 {len(active_tokens)}개 복원")
     print(f"[SD] 모델 로딩 중: {MODEL_ID}")
     try:
         pipe = StableDiffusionPipeline.from_pretrained(
@@ -150,6 +212,7 @@ async def register(req: RegisterRequest):
     _save_users(users)
     token = secrets.token_hex(32)
     active_tokens[token] = user_id
+    _save_tokens()
     return AuthResponse(token=token, user_id=user_id, username=req.username, email=req.email)
 
 
@@ -168,6 +231,7 @@ async def login(req: LoginRequest):
 async def logout(authorization: str = Header(...)):
     if authorization.startswith("Bearer "):
         active_tokens.pop(authorization[7:], None)
+        _save_tokens()
     return {"ok": True}
 
 
@@ -219,6 +283,21 @@ def _generate_one(
 
 # ── 엔드포인트 ────────────────────────────────────────────────────────────────
 
+class AnalyzeImageRequest(BaseModel):
+    image: str  # base64 data URI
+
+
+@app.post("/analyze-image")
+async def analyze_image(req: AnalyzeImageRequest, _: str = Depends(require_auth)):
+    """이미지에서 스타일 프롬프트 추출 (BLIP 캡셔닝)"""
+    try:
+        loop = asyncio.get_event_loop()
+        caption = await loop.run_in_executor(None, _caption_image, req.image)
+        return {"style_prompt": caption}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"이미지 분석 실패: {e}")
+
+
 @app.get("/health")
 async def health():
     """서버 및 모델 상태 확인"""
@@ -242,6 +321,8 @@ async def generate(req: GenerateRequest, _: str = Depends(require_auth)):
     if req.model == "sd15-lcm":
         print("[SD] sd15-lcm 요청 수신 — 현재 SD 1.5로 폴백 (LCM 미구현)")
 
+    prompt = await asyncio.get_event_loop().run_in_executor(None, _translate_if_korean, req.prompt)
+
     loop = asyncio.get_event_loop()
     images: list[str | None] = []
     first_error: str | None = None
@@ -251,7 +332,7 @@ async def generate(req: GenerateRequest, _: str = Depends(require_auth)):
             img = await loop.run_in_executor(
                 executor,
                 lambda: _generate_one(
-                    req.prompt,
+                    prompt,
                     req.negative_prompt,
                     req.width,
                     req.height,
