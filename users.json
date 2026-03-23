@@ -12,5 +12,11 @@
     "email": "1@1.12",
     "salt": "8481287f55af2288e3bcdd1c21f655e2",
     "password_hash": "b143afc40ca8084773e5535e74e129cbf6dee09225e0911f473bfa93818f3b0c"
+  },
+  "3ef5a9833c298348": {
+    "id": "3ef5a9833c298348",
+    "username": "test1",
+    "salt": "6accf93e23a6d65ccf3f48fe5704db7c",
+    "password_hash": "3410bb1cefe1ba9a73ca3d0efa097d5fcffd7113c141691c145809af6e5338c8"
   }
 }
