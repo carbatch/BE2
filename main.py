@@ -205,7 +205,6 @@ def _generate_one(
     steps: int,
     guidance_scale: float,
 ) -> str:
-    """Stable Diffusion 1.5로 이미지 1장 생성 → base64 data URI 반환"""
     assert pipe is not None, "모델이 로드되지 않았습니다."
     result = pipe(
         prompt=prompt,
@@ -222,7 +221,6 @@ def _generate_one(
 
 
 def _run_generation_job(prompt_id: str, prompt: str, count: int, page_id: int) -> None:
-    """ThreadPoolExecutor에서 실행되는 동기 Job 함수"""
     try:
         jobs[prompt_id]["status"] = "running"
         negative_prompt = "blurry, low quality, ugly, deformed, watermark"
@@ -230,7 +228,6 @@ def _run_generation_job(prompt_id: str, prompt: str, count: int, page_id: int) -
 
         for i in range(count):
             data_uri = _generate_one(prompt, negative_prompt, 512, 512, 20, 7.5)
-            # base64 → 파일 저장
             raw = data_uri.split(",", 1)[1]
             img_bytes = base64.b64decode(raw)
             rel_path = f"{page_id}/{prompt_id}_{i}.png"
@@ -242,8 +239,6 @@ def _run_generation_job(prompt_id: str, prompt: str, count: int, page_id: int) -
 
         jobs[prompt_id]["status"] = "done"
         jobs[prompt_id]["image_paths"] = image_paths
-
-        # generations_db 업데이트
         if prompt_id in gens_db:
             gens_db[prompt_id]["status"] = "done"
             gens_db[prompt_id]["image_paths"] = image_paths
@@ -272,7 +267,7 @@ async def lifespan(app: FastAPI):
     print(f"[인증] 저장된 토큰 {len(active_tokens)}개 복원")
     print(f"[DB]  페이지 {len(pages_db)}개, 생성 {len(gens_db)}개 복원")
 
-    # ── GPU / CPU 감지 로그 ────────────────────────────────────────────────────
+    # GPU / CPU 감지 로그
     print("=" * 60)
     if torch.cuda.is_available():
         gpu_count = torch.cuda.device_count()
@@ -280,36 +275,25 @@ async def lifespan(app: FastAPI):
         for i in range(gpu_count):
             props = torch.cuda.get_device_properties(i)
             vram_gb = props.total_memory / 1024 ** 3
-            print(f"[GPU] [{i}] {props.name}")
-            print(f"[GPU]     VRAM        : {vram_gb:.1f} GB")
-            print(f"[GPU]     CUDA Cores  : {props.multi_processor_count} SMs")
-            print(f"[GPU]     Compute Cap : {props.major}.{props.minor}")
-        print(f"[GPU] CUDA 버전   : {torch.version.cuda}")
-        print(f"[GPU] PyTorch     : {torch.__version__}")
-        print(f"[GPU] 사용 dtype  : float16 (FP16 가속)")
+            print(f"[GPU] [{i}] {props.name}  VRAM: {vram_gb:.1f} GB  Compute: {props.major}.{props.minor}")
+        print(f"[GPU] CUDA {torch.version.cuda}  PyTorch {torch.__version__}  dtype: float16")
     else:
         import platform, subprocess
         cpu_name = "알 수 없음"
         try:
             if platform.system() == "Windows":
-                result = subprocess.run(
-                    ["powershell", "-Command", "(Get-CimInstance Win32_Processor).Name"],
-                    capture_output=True, text=True, timeout=5
-                )
-                cpu_name = result.stdout.strip() or "알 수 없음"
+                r = subprocess.run(["powershell", "-Command", "(Get-CimInstance Win32_Processor).Name"],
+                                   capture_output=True, text=True, timeout=5)
+                cpu_name = r.stdout.strip() or "알 수 없음"
             else:
                 with open("/proc/cpuinfo") as f:
                     for line in f:
                         if "model name" in line:
-                            cpu_name = line.split(":")[1].strip()
-                            break
+                            cpu_name = line.split(":")[1].strip(); break
         except Exception:
             pass
-        print("[GPU] ❌ CUDA GPU 없음 — CPU 모드로 실행합니다")
-        print(f"[CPU] {cpu_name}")
-        print(f"[CPU] PyTorch     : {torch.__version__}")
-        print(f"[CPU] 사용 dtype  : float32 (FP32)")
-        print("[CPU] ⚠️  이미지 생성이 매우 느릴 수 있습니다 (GPU 권장)")
+        print(f"[CPU] {cpu_name}  PyTorch {torch.__version__}  dtype: float32")
+        print("[CPU] ⚠️  GPU 없음 — 생성 속도 느림")
     print("=" * 60)
 
     # SD 모델 로드
@@ -329,9 +313,9 @@ async def lifespan(app: FastAPI):
         else:
             pipe.to("cpu")
             print("[SD] CPU 로드 완료 ✅")
-        print("[SD] 모델 준비 완료 — 이미지 생성 요청을 받을 수 있습니다 🎨")
     except Exception as e:
         print(f"[SD] 모델 로드 실패 ❌: {e}")
+
     yield
     del pipe
 
@@ -498,7 +482,6 @@ async def api_generate(req: GenerateRequest, user_id: str = Depends(require_auth
     prompt_id = req.id or secrets.token_hex(8)
     page_id = req.page_id
 
-    # page_id가 없으면 새 페이지 자동 생성
     if page_id is None:
         new_page_id = _next_page_id()
         pages_db[new_page_id] = {
@@ -510,10 +493,7 @@ async def api_generate(req: GenerateRequest, user_id: str = Depends(require_auth
         _save_pages()
         page_id = new_page_id
 
-    # Job 초기화
     jobs[prompt_id] = {"status": "pending", "image_paths": [], "error_msg": None}
-
-    # Generations DB에 등록
     gens_db[prompt_id] = {
         "prompt_id": prompt_id,
         "page_id": page_id,
@@ -525,7 +505,6 @@ async def api_generate(req: GenerateRequest, user_id: str = Depends(require_auth
     }
     _save_gens()
 
-    # 번역 후 비동기 실행
     loop = asyncio.get_event_loop()
     translated = await loop.run_in_executor(None, _translate_if_korean, req.prompt)
     loop.run_in_executor(executor, _run_generation_job, prompt_id, translated, req.count, page_id)
@@ -564,11 +543,14 @@ async def api_extract_style(req: ExtractStyleRequest, _: str = Depends(require_a
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=503, detail="OPENAI_API_KEY가 설정되지 않았습니다. .env 파일에 키를 추가하세요.")
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         style = await loop.run_in_executor(None, _extract_style_openai, req.image)
+        print(f"[OpenAI] 스타일 추출 완료: {style[:80]!r}")
         return {"style": style}
     except Exception as e:
+        import traceback
         print(f"[OpenAI] 스타일 추출 에러: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"스타일 추출 실패: {e}")
 
 
@@ -625,7 +607,23 @@ class LegacyLoginRequest(BaseModel):
 
 @app.post("/auth/register")
 async def legacy_register(req: LegacyRegisterRequest):
-    return await api_register(AuthRequest(username=req.username, password=req.password))
+    users = _load_users()
+    if any(u.get("email") == req.email for u in users.values()):
+        raise HTTPException(status_code=409, detail="이미 사용 중인 이메일입니다.")
+    user_id = secrets.token_hex(8)
+    salt = secrets.token_hex(16)
+    users[user_id] = {
+        "id": user_id,
+        "username": req.username,
+        "email": req.email,
+        "salt": salt,
+        "password_hash": _hash_pw(req.password, salt),
+    }
+    _save_users(users)
+    token = secrets.token_hex(32)
+    active_tokens[token] = user_id
+    _save_tokens()
+    return {"token": token, "user_id": user_id, "username": req.username, "email": req.email}
 
 @app.post("/auth/login")
 async def legacy_login(req: LegacyLoginRequest):
