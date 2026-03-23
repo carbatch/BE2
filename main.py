@@ -35,8 +35,8 @@ load_dotenv()
 
 from deep_translator import GoogleTranslator
 
-import torch
-from diffusers import StableDiffusionPipeline
+# import torch                                    # [SD 비활성화]
+# from diffusers import StableDiffusionPipeline  # [SD 비활성화]
 from openai import OpenAI
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -46,11 +46,10 @@ from pydantic import BaseModel, Field
 
 # ── 전역 상태 ─────────────────────────────────────────────────────────────────
 
-pipe: StableDiffusionPipeline | None = None
-executor = ThreadPoolExecutor(max_workers=1)  # 순차 생성 (VRAM 충돌 방지)
-
-MODEL_ID = "runwayml/stable-diffusion-v1-5"
-HF_TOKEN = os.getenv("HF_TOKEN") or None
+# pipe: StableDiffusionPipeline | None = None      # [SD 비활성화]
+# executor = ThreadPoolExecutor(max_workers=1)      # [SD 비활성화]
+# MODEL_ID = "runwayml/stable-diffusion-v1-5"       # [SD 비활성화]
+# HF_TOKEN = os.getenv("HF_TOKEN") or None          # [SD 비활성화]
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or None
 
 # ── 파일 경로 ─────────────────────────────────────────────────────────────────
@@ -195,129 +194,63 @@ def _next_page_id() -> int:
     return max(pages_db.keys(), default=0) + 1
 
 
-# ── SD 이미지 생성 ─────────────────────────────────────────────────────────────
+# ── SD 이미지 생성 — [SD 비활성화] ────────────────────────────────────────────
 
-def _generate_one(
-    prompt: str,
-    negative_prompt: str,
-    width: int,
-    height: int,
-    steps: int,
-    guidance_scale: float,
-) -> str:
-    assert pipe is not None, "모델이 로드되지 않았습니다."
-    result = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        width=width,
-        height=height,
-        num_inference_steps=steps,
-        guidance_scale=guidance_scale,
-    )
-    img = result.images[0]
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+# def _generate_one(prompt, negative_prompt, width, height, steps, guidance_scale):
+#     assert pipe is not None, "모델이 로드되지 않았습니다."
+#     result = pipe(prompt=prompt, negative_prompt=negative_prompt,
+#                   width=width, height=height,
+#                   num_inference_steps=steps, guidance_scale=guidance_scale)
+#     img = result.images[0]
+#     buf = BytesIO()
+#     img.save(buf, format="PNG")
+#     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-
-def _run_generation_job(prompt_id: str, prompt: str, count: int, page_id: int) -> None:
-    try:
-        jobs[prompt_id]["status"] = "running"
-        negative_prompt = "blurry, low quality, ugly, deformed, watermark"
-        image_paths = []
-
-        for i in range(count):
-            data_uri = _generate_one(prompt, negative_prompt, 512, 512, 20, 7.5)
-            raw = data_uri.split(",", 1)[1]
-            img_bytes = base64.b64decode(raw)
-            rel_path = f"{page_id}/{prompt_id}_{i}.png"
-            out_path = STORAGE_DIR / str(page_id) / f"{prompt_id}_{i}.png"
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-            out_path.write_bytes(img_bytes)
-            image_paths.append(rel_path)
-            print(f"[SD] {prompt_id} — {i+1}/{count} 완료")
-
-        jobs[prompt_id]["status"] = "done"
-        jobs[prompt_id]["image_paths"] = image_paths
-        if prompt_id in gens_db:
-            gens_db[prompt_id]["status"] = "done"
-            gens_db[prompt_id]["image_paths"] = image_paths
-            _save_gens()
-
-    except Exception as e:
-        print(f"[SD] {prompt_id} 생성 실패: {e}")
-        jobs[prompt_id]["status"] = "error"
-        jobs[prompt_id]["error_msg"] = str(e)
-        if prompt_id in gens_db:
-            gens_db[prompt_id]["status"] = "error"
-            gens_db[prompt_id]["error_msg"] = str(e)
-            _save_gens()
+# def _run_generation_job(prompt_id, prompt, count, page_id, width=512, height=512):
+#     try:
+#         jobs[prompt_id]["status"] = "running"
+#         negative_prompt = "blurry, low quality, ugly, deformed, watermark"
+#         image_paths = []
+#         for i in range(count):
+#             data_uri = _generate_one(prompt, negative_prompt, width, height, 20, 7.5)
+#             raw = data_uri.split(",", 1)[1]
+#             img_bytes = base64.b64decode(raw)
+#             rel_path = f"{page_id}/{prompt_id}_{i}.png"
+#             out_path = STORAGE_DIR / str(page_id) / f"{prompt_id}_{i}.png"
+#             out_path.parent.mkdir(parents=True, exist_ok=True)
+#             out_path.write_bytes(img_bytes)
+#             image_paths.append(rel_path)
+#             print(f"[SD] {prompt_id} — {i+1}/{count} 완료")
+#         jobs[prompt_id]["status"] = "done"
+#         jobs[prompt_id]["image_paths"] = image_paths
+#         if prompt_id in gens_db:
+#             gens_db[prompt_id]["status"] = "done"
+#             gens_db[prompt_id]["image_paths"] = image_paths
+#             _save_gens()
+#     except Exception as e:
+#         print(f"[SD] {prompt_id} 생성 실패: {e}")
+#         jobs[prompt_id]["status"] = "error"
+#         jobs[prompt_id]["error_msg"] = str(e)
+#         if prompt_id in gens_db:
+#             gens_db[prompt_id]["status"] = "error"
+#             gens_db[prompt_id]["error_msg"] = str(e)
+#             _save_gens()
 
 
 # ── 앱 생명주기 ───────────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global pipe, active_tokens, pages_db, gens_db
+    global active_tokens, pages_db, gens_db
 
-    # 저장 데이터 복원
     active_tokens = _load_tokens()
     pages_db = _load_pages()
     gens_db = _load_gens()
     print(f"[인증] 저장된 토큰 {len(active_tokens)}개 복원")
     print(f"[DB]  페이지 {len(pages_db)}개, 생성 {len(gens_db)}개 복원")
-
-    # GPU / CPU 감지 로그
-    print("=" * 60)
-    if torch.cuda.is_available():
-        gpu_count = torch.cuda.device_count()
-        print(f"[GPU] ✅ CUDA GPU 감지됨 — 총 {gpu_count}개")
-        for i in range(gpu_count):
-            props = torch.cuda.get_device_properties(i)
-            vram_gb = props.total_memory / 1024 ** 3
-            print(f"[GPU] [{i}] {props.name}  VRAM: {vram_gb:.1f} GB  Compute: {props.major}.{props.minor}")
-        print(f"[GPU] CUDA {torch.version.cuda}  PyTorch {torch.__version__}  dtype: float16")
-    else:
-        import platform, subprocess
-        cpu_name = "알 수 없음"
-        try:
-            if platform.system() == "Windows":
-                r = subprocess.run(["powershell", "-Command", "(Get-CimInstance Win32_Processor).Name"],
-                                   capture_output=True, text=True, timeout=5)
-                cpu_name = r.stdout.strip() or "알 수 없음"
-            else:
-                with open("/proc/cpuinfo") as f:
-                    for line in f:
-                        if "model name" in line:
-                            cpu_name = line.split(":")[1].strip(); break
-        except Exception:
-            pass
-        print(f"[CPU] {cpu_name}  PyTorch {torch.__version__}  dtype: float32")
-        print("[CPU] ⚠️  GPU 없음 — 생성 속도 느림")
-    print("=" * 60)
-
-    # SD 모델 로드
-    print(f"[SD] 모델 로딩 중: {MODEL_ID}")
-    try:
-        pipe = StableDiffusionPipeline.from_pretrained(
-            MODEL_ID,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-            token=HF_TOKEN,
-            safety_checker=None,
-            requires_safety_checker=False,
-        )
-        if torch.cuda.is_available():
-            pipe.to("cuda")
-            pipe.enable_attention_slicing()
-            print(f"[SD] GPU 로드 완료 ✅ ({torch.cuda.get_device_name(0)})")
-        else:
-            pipe.to("cpu")
-            print("[SD] CPU 로드 완료 ✅")
-    except Exception as e:
-        print(f"[SD] 모델 로드 실패 ❌: {e}")
+    print("[SD] ⚠️  SD 모델 비활성화 — OpenAI API만 사용")
 
     yield
-    del pipe
 
 
 # ── FastAPI 앱 ────────────────────────────────────────────────────────────────
@@ -472,44 +405,35 @@ class GenerateRequest(BaseModel):
     id: Optional[str] = None
     count: int = Field(default=1, ge=1, le=8)
     page_id: Optional[int] = None
+    width: int = Field(default=512, ge=256, le=1024)
+    height: int = Field(default=512, ge=256, le=1024)
 
 
 @app.post("/api/v1/generate", status_code=202)
 async def api_generate(req: GenerateRequest, user_id: str = Depends(require_auth)):
-    if pipe is None:
-        raise HTTPException(status_code=503, detail="모델 로딩 중입니다. /health 에서 model_loaded가 true가 될 때까지 대기하세요.")
-
-    prompt_id = req.id or secrets.token_hex(8)
-    page_id = req.page_id
-
-    if page_id is None:
-        new_page_id = _next_page_id()
-        pages_db[new_page_id] = {
-            "id": new_page_id,
-            "user_id": user_id,
-            "title": req.prompt[:30],
-            "created_at": datetime.now().isoformat(),
-        }
-        _save_pages()
-        page_id = new_page_id
-
-    jobs[prompt_id] = {"status": "pending", "image_paths": [], "error_msg": None}
-    gens_db[prompt_id] = {
-        "prompt_id": prompt_id,
-        "page_id": page_id,
-        "prompt_text": req.prompt,
-        "status": "pending",
-        "image_paths": [],
-        "error_msg": None,
-        "created_at": datetime.now().isoformat(),
-    }
-    _save_gens()
-
-    loop = asyncio.get_event_loop()
-    translated = await loop.run_in_executor(None, _translate_if_korean, req.prompt)
-    loop.run_in_executor(executor, _run_generation_job, prompt_id, translated, req.count, page_id)
-
-    return {"prompt_id": prompt_id, "page_id": page_id, "status": "pending"}
+    raise HTTPException(status_code=503, detail="SD 모델이 비활성화되어 있습니다.")
+    # ── SD 활성화 시 아래 코드로 교체 ──────────────────────────────────────────
+    # if pipe is None:
+    #     raise HTTPException(status_code=503, detail="모델 로딩 중입니다.")
+    # prompt_id = req.id or secrets.token_hex(8)
+    # page_id = req.page_id
+    # if page_id is None:
+    #     new_page_id = _next_page_id()
+    #     pages_db[new_page_id] = {"id": new_page_id, "user_id": user_id,
+    #                              "title": req.prompt[:30], "created_at": datetime.now().isoformat()}
+    #     _save_pages()
+    #     page_id = new_page_id
+    # jobs[prompt_id] = {"status": "pending", "image_paths": [], "error_msg": None}
+    # gens_db[prompt_id] = {"prompt_id": prompt_id, "page_id": page_id,
+    #                       "prompt_text": req.prompt, "status": "pending",
+    #                       "image_paths": [], "error_msg": None,
+    #                       "created_at": datetime.now().isoformat()}
+    # _save_gens()
+    # loop = asyncio.get_event_loop()
+    # translated = await loop.run_in_executor(None, _translate_if_korean, req.prompt)
+    # loop.run_in_executor(executor, _run_generation_job,
+    #                      prompt_id, translated, req.count, page_id, req.width, req.height)
+    # return {"prompt_id": prompt_id, "page_id": page_id, "status": "pending"}
 
 
 @app.get("/api/v1/generations/{prompt_id}/status")
@@ -587,10 +511,9 @@ async def api_download_zip(page_id: int, user_id: str = Depends(require_auth)):
 async def health():
     return {
         "status": "ok",
-        "model_loaded": pipe is not None,
-        "model_id": MODEL_ID,
-        "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "model_loaded": False,
+        "model_id": None,
+        "device": None,
     }
 
 
