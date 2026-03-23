@@ -548,6 +548,13 @@ async def legacy_register(req: LegacyRegisterRequest):
     _save_tokens()
     return {"token": token, "user_id": user_id, "username": req.username, "email": req.email}
 
+@app.post("/auth/logout")
+async def legacy_logout(authorization: str = Header(...)):
+    if authorization.startswith("Bearer "):
+        active_tokens.pop(authorization[7:], None)
+        _save_tokens()
+    return {"ok": True}
+
 @app.post("/auth/login")
 async def legacy_login(req: LegacyLoginRequest):
     users = _load_users()
@@ -557,4 +564,4 @@ async def legacy_login(req: LegacyLoginRequest):
     token = secrets.token_hex(32)
     active_tokens[token] = user["id"]
     _save_tokens()
-    return {"token": token, "user_id": user["id"], "username": user["username"]}
+    return {"token": token, "user_id": user["id"], "username": user["username"], "email": user.get("email", "")}
