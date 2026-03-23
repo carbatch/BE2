@@ -30,11 +30,14 @@ from io import BytesIO
 from PIL import Image
 import zipfile
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from deep_translator import GoogleTranslator
 
 import torch
 from diffusers import StableDiffusionPipeline
-from transformers import AutoProcessor, AutoModelForCausalLM
+from openai import OpenAI
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
@@ -48,6 +51,7 @@ executor = ThreadPoolExecutor(max_workers=1)  # 순차 생성 (VRAM 충돌 방�
 
 MODEL_ID = "runwayml/stable-diffusion-v1-5"
 HF_TOKEN = os.getenv("HF_TOKEN") or None
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or None
 
 # ── 파일 경로 ─────────────────────────────────────────────────────────────────
 
@@ -83,82 +87,49 @@ def _translate_if_korean(text: str) -> str:
         return text
 
 
-# ── Florence-2 (이미지 스타일 추출) ───────────────────────────────────────────
+# ── OpenAI Vision — 이미지 스타일 추출 ───────────────────────────────────────
 
-VL_MODEL_ID = "microsoft/Florence-2-base"
-_vl_processor: AutoProcessor | None = None
-_vl_model:     AutoModelForCausalLM | None = None
+def _extract_style_openai(image_b64: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다. .env 파일에 키를 추가하세요.")
 
+    if "," in image_b64:
+        header, raw = image_b64.split(",", 1)
+        media_type = header.split(":")[1].split(";")[0]  # e.g. image/png
+    else:
+        raw = image_b64
+        media_type = "image/png"
 
-def _load_vl() -> tuple[AutoProcessor, AutoModelForCausalLM]:
-    global _vl_processor, _vl_model
-    if _vl_processor is None:
-        import traceback as _tb
-        print(f"[VL] 모델 로딩 중: {VL_MODEL_ID}")
-        try:
-            # Transformers 4.45+ 호환성을 위한 원숭이 패치
-            from transformers.configuration_utils import PretrainedConfig
-            from transformers import PreTrainedTokenizerFast, RobertaTokenizer
-            if not hasattr(PretrainedConfig, "forced_bos_token_id"):
-                PretrainedConfig.forced_bos_token_id = None
-            if not hasattr(PreTrainedTokenizerFast, "additional_special_tokens"):
-                PreTrainedTokenizerFast.additional_special_tokens = property(lambda self: [])
-            if not hasattr(RobertaTokenizer, "additional_special_tokens"):
-                RobertaTokenizer.additional_special_tokens = property(lambda self: [])
-
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            dtype  = torch.float16 if torch.cuda.is_available() else torch.float32
-            print(f"[VL] device={device}, dtype={dtype}")
-
-            _vl_processor = AutoProcessor.from_pretrained(
-                VL_MODEL_ID, trust_remote_code=True
-            )
-            _vl_model = AutoModelForCausalLM.from_pretrained(
-                VL_MODEL_ID,
-                trust_remote_code=True,
-                dtype=dtype,
-                attn_implementation="eager",   # transformers 5.x SDPA 호환성 우회
-                low_cpu_mem_usage=False,        # meta tensor 비활성화 (Florence-2 구형 코드 호환)
-            ).eval().to(device)
-            print(f"[VL] ✅ 모델 로드 완료 (device={device})")
-        except Exception:
-            print("[VL] ❌ 모델 로드 실패:")
-            import traceback as _tb
-            _tb.print_exc()
-            raise
-    return _vl_processor, _vl_model
-
-
-def _extract_style_local(image_b64: str) -> str:
-    import traceback as _tb
-    try:
-        processor, model = _load_vl()
-        raw = image_b64.split(",", 1)[1] if "," in image_b64 else image_b64
-        img = Image.open(BytesIO(base64.b64decode(raw))).convert("RGB")
-        task = "<MORE_DETAILED_CAPTION>"
-        inputs = processor(text=task, images=img, return_tensors="pt")
-        model_dtype = next(model.parameters()).dtype
-        # float 텐서(pixel_values 등)만 모델 dtype으로 캐스팅, 정수형(input_ids)은 device만 이동
-        inputs = {
-            k: (v.to(model.device, dtype=model_dtype) if v.is_floating_point() else v.to(model.device))
-            for k, v in inputs.items()
-        }
-        with torch.no_grad():
-            generated_ids = model.generate(
-                input_ids=inputs["input_ids"],
-                pixel_values=inputs["pixel_values"],
-                max_new_tokens=200,
-                do_sample=False,
-            )
-        generated_text = processor.batch_decode(generated_ids, skip_special_tokens=False)[0]
-        result = processor.post_process_generation(
-            generated_text, task=task, image_size=(img.width, img.height),
-        )
-        return result[task]
-    except Exception as e:
-        print("[VL] ❌ 스타일 추출 중 오류:")
-        _tb.print_exc()
-        raise
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    response = client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{media_type};base64,{raw}",
+                            "detail": "low",
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": (
+                            "Analyze the visual style of this image and output a concise "
+                            "Stable Diffusion style prompt (comma-separated keywords, English only). "
+                            "Focus on: lighting, color palette, mood, texture, artistic style, "
+                            "camera/lens feel. Do NOT describe the subject or content. "
+                            "Output only the keywords, no explanation."
+                        ),
+                    },
+                ],
+            }
+        ],
+        max_tokens=150,
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ── 인증 유틸 ─────────────────────────────────────────────────────────────────
@@ -590,14 +561,14 @@ class ExtractStyleRequest(BaseModel):
 
 @app.post("/api/v1/extract-style")
 async def api_extract_style(req: ExtractStyleRequest, _: str = Depends(require_auth)):
-    import traceback as _tb
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OPENAI_API_KEY가 설정되지 않았습니다. .env 파일에 키를 추가하세요.")
     try:
         loop = asyncio.get_event_loop()
-        style = await loop.run_in_executor(None, _extract_style_local, req.image)
+        style = await loop.run_in_executor(None, _extract_style_openai, req.image)
         return {"style": style}
     except Exception as e:
-        print(f"[VL] API 에러: {e}")
-        _tb.print_exc()
+        print(f"[OpenAI] 스타일 추출 에러: {e}")
         raise HTTPException(status_code=500, detail=f"스타일 추출 실패: {e}")
 
 

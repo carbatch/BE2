@@ -1,17 +1,40 @@
-# Python 캐시 파일
-**/__pycache__/
+# 환경 변수 (API 키 등 민감 정보)
+.env
+.env.*
+
+# Python
+__pycache__/
 *.py[cod]
-*$py.class
-
-# 가상 환경
-venv/
-env/
-.venv/
-
-# 패키지 관리
+*.pyo
+*.pyd
+*.so
+*.egg
 *.egg-info/
 dist/
 build/
+.eggs/
 
-#model
-models/
+# 가상환경
+venv/
+.venv/
+env/
+.env.bak
+
+# 데이터 파일 (자동 생성)
+users.json
+tokens.json
+pages.json
+generations.json
+storage/
+
+# HuggingFace 모델 캐시
+*.cache/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
